@@ -1,521 +1,153 @@
-"""Binary sensors for BYD Vehicle."""
-
+"""Binary sensors for BYD vehicle."""
 from __future__ import annotations
-
-from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any
 
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntity,
-    BinarySensorEntityDescription,
 )
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EntityCategory
-from homeassistant.core import HomeAssistant
+from homeassistant.const import STATE_UNKNOWN
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from pybyd.models.realtime import (
-    DoorOpenState,
-    WindowState,
-)
-from pybyd.models.vehicle import Vehicle
+from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
-from .const import DOMAIN
-from .coordinator import BydDataUpdateCoordinator
-from .entity import BydVehicleEntity
+from .coordinator import BYDDataUpdateCoordinator
 
 
-@dataclass(frozen=True, kw_only=True)
-class BydBinarySensorDescription(BinarySensorEntityDescription):
-    """Describe a BYD binary sensor."""
-
-    source: str = "realtime"
-    attr_key: str | None = None
-    value_fn: Callable[[Any], bool | None] | None = None
-
-
-def _is_charging_from_realtime(obj: Any) -> bool | None:
-    """Return whether the vehicle is actively charging from realtime state."""
-    return getattr(obj, "is_charging", None)
-
-
-def _attr_truthy(attr_name: str) -> Callable[[Any], bool | None]:
-    """Return a value_fn that checks ``bool(getattr(obj, attr_name))``."""
-
-    def _fn(obj: Any) -> bool | None:
-        val = getattr(obj, attr_name, None)
-        if val is None:
-            return None
-        return bool(val)
-
-    return _fn
-
-
-def _attr_equals(attr_name: str, target: Any) -> Callable[[Any], bool | None]:
-    """Return a value_fn that checks ``getattr(obj, attr_name) == target``."""
-
-    def _fn(obj: Any) -> bool | None:
-        val = getattr(obj, attr_name, None)
-        if val is None:
-            return None
-        return val == target
-
-    return _fn
-
-
-def _sentinel_int_on(attr_name: str) -> Callable[[Any], bool | None]:
-    """Return a value_fn converting an integer indicator to bool.
-
-    pyBYD normalises ``-1`` sentinels to ``None``.  This helper maps
-    ``0`` → ``False`` (off) and any value ``> 0`` → ``True`` (on).
-    """
-
-    def _fn(obj: Any) -> bool | None:
-        val = getattr(obj, attr_name, None)
-        if val is None:
-            return None
-        return val > 0
-
-    return _fn
-
-
-BINARY_SENSOR_DESCRIPTIONS: tuple[BydBinarySensorDescription, ...] = (
-    # =================================
-    # Aggregate states (enabled)
-    # =================================
-    BydBinarySensorDescription(
-        key="is_online",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.CONNECTIVITY,
-        value_fn=lambda r: r.is_online,
-    ),
-    BydBinarySensorDescription(
-        key="is_charging",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.BATTERY_CHARGING,
-        value_fn=_is_charging_from_realtime,
-    ),
-    BydBinarySensorDescription(
-        key="is_any_door_open",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.DOOR,
-        value_fn=lambda r: r.is_any_door_open,
-    ),
-    BydBinarySensorDescription(
-        key="is_any_window_open",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.WINDOW,
-        value_fn=lambda r: r.is_any_window_open,
-    ),
-    BydBinarySensorDescription(
-        key="is_locked",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.LOCK,
-        # is_locked returns True when locked; for BinarySensorDeviceClass.LOCK,
-        # is_on=True means "problem" (unlocked), so invert. None propagates as-is.
-        value_fn=lambda r: None if (v := r.is_locked) is None else not v,
-    ),
-    BydBinarySensorDescription(
-        key="sentry_status",
-        source="realtime",
-        icon="mdi:shield-car",
-        value_fn=_attr_truthy("sentry_status"),
-    ),
-    # ====================================
-    # Individual doors (disabled)
-    # ====================================
-    BydBinarySensorDescription(
-        key="left_front_door",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.DOOR,
-        value_fn=_attr_equals("left_front_door", DoorOpenState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="right_front_door",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.DOOR,
-        value_fn=_attr_equals("right_front_door", DoorOpenState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="left_rear_door",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.DOOR,
-        value_fn=_attr_equals("left_rear_door", DoorOpenState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="right_rear_door",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.DOOR,
-        value_fn=_attr_equals("right_rear_door", DoorOpenState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="trunk_lid",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.DOOR,
-        value_fn=_attr_equals("trunk_lid", DoorOpenState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="sliding_door",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.DOOR,
-        value_fn=_attr_equals("sliding_door", DoorOpenState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="forehold",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.DOOR,
-        value_fn=_attr_equals("forehold", DoorOpenState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    # ====================================
-    # Individual windows (disabled)
-    # ====================================
-    BydBinarySensorDescription(
-        key="left_front_window",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.WINDOW,
-        value_fn=_attr_equals("left_front_window", WindowState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="right_front_window",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.WINDOW,
-        value_fn=_attr_equals("right_front_window", WindowState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="left_rear_window",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.WINDOW,
-        value_fn=_attr_equals("left_rear_window", WindowState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="right_rear_window",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.WINDOW,
-        value_fn=_attr_equals("right_rear_window", WindowState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    BydBinarySensorDescription(
-        key="skylight",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.WINDOW,
-        value_fn=_attr_equals("skylight", WindowState.OPEN),
-        entity_registry_enabled_default=False,
-    ),
-    # ====================================
-    # Other (disabled)
-    # ====================================
-    BydBinarySensorDescription(
-        key="battery_heat_state",
-        source="realtime",
-        icon="mdi:heat-wave",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_attr_truthy("battery_heat_state"),
-    ),
-    # ====================================
-    # Warning / status indicators (disabled)
-    # ====================================
-    BydBinarySensorDescription(
-        key="abs_warning",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-brake-abs",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("abs_warning"),
-    ),
-    BydBinarySensorDescription(
-        key="svs",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-wrench",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("svs"),
-    ),
-    BydBinarySensorDescription(
-        key="srs",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:airbag",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("srs"),
-    ),
-    BydBinarySensorDescription(
-        key="eps",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:steering",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("eps"),
-    ),
-    BydBinarySensorDescription(
-        key="esp",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-traction-control",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("esp"),
-    ),
-    BydBinarySensorDescription(
-        key="pwr",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:flash-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("pwr"),
-    ),
-    BydBinarySensorDescription(
-        key="power_system",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:flash",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("power_system"),
-    ),
-    BydBinarySensorDescription(
-        key="ect",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:coolant-temperature",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("ect"),
-    ),
-    BydBinarySensorDescription(
-        key="tirepressure_system",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-tire-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("tirepressure_system"),
-    ),
-    BydBinarySensorDescription(
-        key="rapid_tire_leak",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-tire-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("rapid_tire_leak"),
-    ),
-    BydBinarySensorDescription(
-        key="left_front_tire_status",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-tire-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("left_front_tire_status"),
-    ),
-    BydBinarySensorDescription(
-        key="right_front_tire_status",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-tire-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("right_front_tire_status"),
-    ),
-    BydBinarySensorDescription(
-        key="left_rear_tire_status",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-tire-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("left_rear_tire_status"),
-    ),
-    BydBinarySensorDescription(
-        key="right_rear_tire_status",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        icon="mdi:car-tire-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("right_rear_tire_status"),
-    ),
-    BydBinarySensorDescription(
-        key="upgrade_status",
-        source="realtime",
-        icon="mdi:cellphone-arrow-down",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("upgrade_status"),
-    ),
-    BydBinarySensorDescription(
-        key="charge_heat_state",
-        source="realtime",
-        icon="mdi:heat-wave",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_attr_truthy("charge_heat_state"),
-    ),
-    BydBinarySensorDescription(
-        key="vehicle_state",
-        source="realtime",
-        device_class=BinarySensorDeviceClass.POWER,
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda r: r.is_vehicle_on,
-    ),
-    # ====================================
-    # Additional warnings (disabled)
-    # ====================================
-    BydBinarySensorDescription(
-        key="oil_pressure_system",
-        source="realtime",
-        icon="mdi:oil",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("oil_pressure_system"),
-    ),
-    BydBinarySensorDescription(
-        key="braking_system",
-        source="realtime",
-        icon="mdi:car-brake-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("braking_system"),
-    ),
-    BydBinarySensorDescription(
-        key="charging_system",
-        source="realtime",
-        icon="mdi:ev-station",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("charging_system"),
-    ),
-    BydBinarySensorDescription(
-        key="steering_system",
-        source="realtime",
-        icon="mdi:steering",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_sentinel_int_on("steering_system"),
-    ),
-    BydBinarySensorDescription(
-        key="less_one_min",
-        source="realtime",
-        icon="mdi:timer-alert",
-        entity_registry_enabled_default=False,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=_attr_truthy("less_one_min"),
-    ),
-)
-
-
-async def async_setup_entry(
+async def async_setup_platform(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    config: ConfigType,
     async_add_entities: AddEntitiesCallback,
+    discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up BYD binary sensors from a config entry."""
-    data = hass.data[DOMAIN][entry.entry_id]
-    coordinators: dict[str, BydDataUpdateCoordinator] = data["coordinators"]
+    """Set up binary sensor platform."""
+    if discovery_info is None:
+        return
+
+    coordinator: BYDDataUpdateCoordinator = discovery_info["coordinator"]
+    byd_vehicle = discovery_info["vin"]
 
     entities: list[BinarySensorEntity] = []
-    for vin, coordinator in coordinators.items():
-        vehicle = coordinator.vehicle
-        for description in BINARY_SENSOR_DESCRIPTIONS:
-            entities.append(BydBinarySensor(coordinator, vin, vehicle, description))
+
+    # Add existing BYD vehicle binary sensors
+    for sensor_key in coordinator.data.get(byd_vehicle, {}):
+        if sensor_key in BYDVehicleBinarySensor.SENSOR_TYPES:
+            entities.append(
+                BYDVehicleBinarySensor(
+                    coordinator=coordinator,
+                    vin=byd_vehicle,
+                    sensor_type=sensor_key,
+                )
+            )
+
+    # Add Zaptec plug sensor
+    entities.append(BYDZaptecPlugSensor(hass))
 
     async_add_entities(entities)
 
 
-class BydBinarySensor(BydVehicleEntity, BinarySensorEntity):
-    """Representation of a BYD vehicle binary sensor."""
+class BYDVehicleBinarySensor(BinarySensorEntity):
+    """Representation of BYD vehicle binary sensor."""
 
-    _attr_has_entity_name = True
-    entity_description: BydBinarySensorDescription
+    SENSOR_TYPES: dict[str, tuple[BinarySensorDeviceClass, str]] = {
+        "locked": (BinarySensorDeviceClass.LOCK, "Locked"),
+        "doors_locked": (BinarySensorDeviceClass.LOCK, "Doors Locked"),
+        "car_locked": (BinarySensorDeviceClass.LOCK, "Car Locked"),
+        # Add other binary sensors as needed
+    }
 
     def __init__(
         self,
-        coordinator: BydDataUpdateCoordinator,
+        coordinator: BYDDataUpdateCoordinator,
         vin: str,
-        vehicle: Vehicle,
-        description: BydBinarySensorDescription,
+        sensor_type: str,
     ) -> None:
         """Initialize the binary sensor."""
-        super().__init__(coordinator)
-        self.entity_description = description
-        self._attr_translation_key = description.key
-        self._vin = vin
-        self._vehicle = vehicle
-        self._attr_unique_id = f"{vin}_{description.source}_{description.key}"
-        self._last_is_on: bool | None = None
+        self.coordinator = coordinator
+        self.vin = vin
+        self.sensor_type = sensor_type
 
-        # Auto-disable binary sensors that return no data on first fetch.
-        if description.entity_registry_enabled_default is not False:
-            if self._resolve_value() is None:
-                self._attr_entity_registry_enabled_default = False
+        device_class, name = self.SENSOR_TYPES[sensor_type]
+        self._attr_device_class = device_class
+        self._attr_name = name
+        self._attr_unique_id = f"{vin}_{sensor_type}"
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _resolve_value(self) -> bool | None:
-        """Extract the current value using the description's extraction logic."""
-        obj = self._get_source_obj(self.entity_description.source)
-        if obj is None:
-            return None
-        if self.entity_description.value_fn is not None:
-            return self.entity_description.value_fn(obj)
-        attr = self.entity_description.attr_key or self.entity_description.key
-        value = getattr(obj, attr, None)
-        if value is None:
-            return None
-        return bool(value)
-
-    # ------------------------------------------------------------------
-    # Entity properties
-    # ------------------------------------------------------------------
+    @property
+    def is_on(self) -> bool:
+        """Return True if binary sensor is on."""
+        return self.coordinator.data.get(self.vin, {}).get(self.sensor_type, False)
 
     @property
     def available(self) -> bool:
-        """Return True when the coordinator has data for this source."""
-        return (
-            super().available
-            and self._get_source_obj(self.entity_description.source) is not None
+        """Return if entity is available."""
+        return self.coordinator.last_update_success
+
+
+class BYDZaptecPlugSensor(BinarySensorEntity):
+    """Binary sensor for BYD Sealion 7 plug status via Zaptec charger mode."""
+
+    _attr_unique_id = "byd_sealion_7_plug"
+    _attr_name = "BYD Sealion 7 Plug"
+    _attr_device_class = BinarySensorDeviceClass.PLUG
+    _attr_icon = "mdi:power-plug"
+
+    # Source sensor for charger mode
+    _source_sensor = "sensor.eleanor_zaptec_charger_mode"
+
+    # State that indicates the charger is NOT plugged in
+    _unplugged_state = "Disconnected"
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        """Initialize the binary sensor."""
+        self.hass = hass
+        self._attr_is_on = None
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to state changes of the Zaptec charger mode sensor."""
+        await super().async_added_to_hass()
+
+        # Set initial state
+        self._update_state()
+
+        # Subscribe to state changes
+        self.async_on_remove(
+            async_track_state_change_event(
+                self.hass,
+                [self._source_sensor],
+                self._on_sensor_state_changed,
+            )
         )
 
+    @callback
+    def _on_sensor_state_changed(self, event) -> None:
+        """Handle sensor state changes."""
+        self._update_state()
+        self.async_write_ha_state()
+
+    @callback
+    def _update_state(self) -> None:
+        """Update the binary sensor state based on Zaptec charger mode."""
+        state = self.hass.states.get(self._source_sensor)
+
+        if state is None:
+            # Sensor doesn't exist
+            self._attr_is_on = None
+            self._attr_available = False
+        elif state.state in (STATE_UNKNOWN, "unknown"):
+            # Unknown state - we don't know if it's plugged in
+            self._attr_is_on = None
+            self._attr_available = False
+        elif state.state == self._unplugged_state:
+            # Explicitly disconnected
+            self._attr_is_on = False
+            self._attr_available = True
+        else:
+            # Any other state = plugged in
+            # Examples: "Connected", "Charging", "Ready", etc.
+            self._attr_is_on = True
+            self._attr_available = True
+
     @property
-    def is_on(self) -> bool | None:
-        """Return the binary sensor state.
-
-        Returns ``None`` (unknown) when the value is not available in the
-        current data fetch.  Falls back to the last known value only when
-        the coordinator itself has no data (entity is borderline unavailable).
-        """
-        value = self._resolve_value()
-        if value is not None:
-            return value
-        # Source object missing → coordinator has no data yet; use cache.
-        if self._get_source_obj(self.entity_description.source) is None:
-            return self._last_is_on
-        # Source exists but value is None → genuinely unknown.
-        return None
-
-    def _handle_coordinator_update(self) -> None:
-        """Track last known state, then run standard coordinator update."""
-        value = self._resolve_value()
-        if value is not None:
-            self._last_is_on = value
-        super()._handle_coordinator_update()
+    def should_poll(self) -> bool:
+        """No polling needed, we track state changes."""
+        return False
